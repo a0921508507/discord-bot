@@ -1,6 +1,14 @@
-discord.py>=2.3.2
-google-genai>=0.1.1
-requests>=2.31.0
-wikipedia>=1.4.0
-apscheduler>=3.10.4
-pillow>=10.2.0
+# Discord 機器人 Token
+TOKEN= "MTUxOTYzMDEwMjUwODQ3MDI3NA.GPulxZ.1CLqaGvPVn8pkjqwtUFL2uX0IGSYNwF_2Tb0vY"
+
+# Google Gemini API Key
+GEMINI_API_KEY= "AQ.Ab8RN6I6LYWBOmXEyPloggUCIZonUuH8KB-TBKQqC0bhyE3D_w"
+
+# 三個功能頻道的 ID（請填入正確的數字ID）
+DODGERS_CHANNEL_ID=1519642817637646438
+WIKI_CHANNEL_ID=1519663745192825024
+IMAGE_CHANNEL_ID=1519706980728705197
+
+# 每日定時播報時間（24小時制）
+AUTO_POST_HOUR=8
+AUTO_POST_MINUTE=0
