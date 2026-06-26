@@ -1,251 +1,174 @@
-import datetime
-import io
 import os
-import time  # 👈 新增：用於計算時間差
-import requests
-import wikipedia
 import discord
 from discord.ext import commands
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import wikipedia
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
+import requests
+from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-# ==================== 🛠️ 請在這裡修改你的設定 ====================
-TOKEN = "MTUxOTYzMDEwMjUwODQ3MDI3NA.GrzinC.Ipvno_M-PVaw_e3IgCf2NmW6AvDzPF5LRdrbkA"
-GEMINI_API_KEY = "AQ.Ab8RN6I6LYWBOmXEyPloggUCIZonUuH8KB-TBKQqC0bhyE3D_w"
+# ============================================================
+# 載入環境變數
+# ============================================================
+load_dotenv()
 
-REMIND_CHANNEL_ID = 1519642817637646438  # 每日道奇名單推播的頻道 ID
-SEARCH_CHANNEL_ID = 1519663745192825024  # 專屬搜尋頻道的 ID
-# ================================================================
+TOKEN = os.getenv("TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DODGERS_CHANNEL_ID = int(os.getenv("DODGERS_CHANNEL_ID"))
+WIKI_CHANNEL_ID = int(os.getenv("WIKI_CHANNEL_ID"))
+IMAGE_CHANNEL_ID = int(os.getenv("IMAGE_CHANNEL_ID"))
+AUTO_POST_HOUR = int(os.getenv("AUTO_POST_HOUR", 8))
+AUTO_POST_MINUTE = int(os.getenv("AUTO_POST_MINUTE", 0))
 
-# 初始化 Discord 機器人設定
+# 檢查必要的環境變數是否存在
+if not all([TOKEN, GEMINI_API_KEY]):
+    raise ValueError("請在 .env 中設定 TOKEN 與 GEMINI_API_KEY")
+
+# ============================================================
+# 初始化客戶端與機器人
+# ============================================================
+wikipedia.set_lang("zh-tw")
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 初始化 Google Gemini AI 客戶端
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# 排程器指定時區（台灣時間）
+scheduler = AsyncIOScheduler(timezone='Asia/Taipei')
 
-# 其它套件設定
-DODGERS_TEAM_ID = 119
-wikipedia.set_lang("zh")
+# ============================================================
+# 定時任務：道奇隊賽事自動播報
+# ============================================================
+async def auto_post_dodgers_lineup():
+    """每日定時發送道奇隊賽事資訊"""
+    channel = bot.get_channel(DODGERS_CHANNEL_ID)
+    if not channel:
+        print("❌ 找不到道奇隊指定頻道")
+        return
 
-# ⏱️ 紀錄使用者最後觸發功能的時間 (格式: {user_id: timestamp})
-last_image_time = {}
-last_wiki_time = {}
+    today = datetime.now().strftime('%Y-%m-%d')
+    schedule_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&teamId=119"
+    message_content = f"📅 今日 ({today}) 道奇隊無賽事喔！"
 
-# 調整冷卻時間（秒）
-IMAGE_COOLDOWN = 3  # 圖片辨識每 30 秒只能用一次
-WIKI_COOLDOWN = 3   # 維基搜尋每 15 秒只能用一次
-
-
-# ==============================================================================
-#  功能區塊一：【道奇隊名單功能】(MLB API)
-# ==============================================================================
-def get_position_name(code):
-    pos_map = {
-        "1": "投手 P", "2": "捕手 C", "3": "一壘手 1B", "4": "二壘手 2B",
-        "5": "三壘手 3B", "6": "游擊手 SS", "7": "左外野手 LF", "8": "中外野手 CF",
-        "9": "右外野手 RF", "DH": "指定打擊 DH",
-    }
-    return pos_map.get(code, code)
-
-
-def fetch_dodgers_lineup():
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    schedule_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&teamId={DODGERS_TEAM_ID}"
     try:
-        response = requests.get(schedule_url).json()
-        if not response.get("dates") or len(response["dates"][0]["games"]) == 0:
-            return discord.Embed(
-                title="📅 今日無賽事",
-                description=f"道奇隊今天 ({today}) 沒有比賽喔！",
-                color=0x888888,
-            )
-
-        game_data = response["dates"][0]["games"][0]
-        game_pk = game_data["gamePk"]
-        is_home = game_data["teams"]["home"]["team"]["id"] == DODGERS_TEAM_ID
-        opponent = game_data["teams"]["away"]["team"]["name"] if is_home else game_data["teams"]["home"]["team"]["name"]
-
-        boxscore_url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
-        boxscore_res = requests.get(boxscore_url).json()
-
-        team_key = "home" if is_home else "away"
-        dodgers_data = boxscore_res["teams"][team_key]
-        lineup_ids = dodgers_data.get("battingOrder", [])
-
-        if not lineup_ids:
-            return discord.Embed(
-                title=f"⚾ 今日賽事：道奇 vs {opponent}",
-                description=f"日期：{today}\n\n⚠️ **官方尚未公布今日的先發出賽名單！**\n（通常於開賽前 2~3 小時公布）",
-                color=0xFFCC00,
-            )
-
-        embed = discord.Embed(
-            title="💙 道奇隊今日先發出賽名單 💙",
-            description=f"對手：**{opponent}**\n日期：{today}",
-            color=0x005A9C,
-        )
-
-        lineup_text = ""
-        for index, player_id in enumerate(lineup_ids, 1):
-            player_key = f"ID{player_id}"
-            player = dodgers_data["players"].get(player_key, {})
-            if player:
-                name = player["person"]["fullName"]
-                pos = player["position"]["abbreviation"]
-                pos_zh = get_position_name(pos)
-                jersey = player["jerseyNumber"]
-                lineup_text += f"**{index}棒** | #{jersey} {name} ({pos_zh})\n"
-
-        pitcher_id = dodgers_data.get("pitchers", [None])[0]
-        if pitcher_id:
-            pitcher_player = dodgers_data["players"].get(f"ID{pitcher_id}", {})
-            p_name = pitcher_player["person"]["fullName"]
-            p_jersey = pitcher_player["jerseyNumber"]
-            embed.add_field(name="🔥 今日先發投手", value=f"#{p_jersey} {p_name}", inline=False)
-
-        embed.add_field(name="📋 先發打序", value=lineup_text, inline=False)
-        embed.set_thumbnail(url="https://midfield.com/wp-content/uploads/2021/04/LA-Logo.png")
-        return embed
+        res = requests.get(schedule_url, timeout=10)
+        res.raise_for_status()
+        response = res.json()
+        if response.get("dates") and len(response["dates"]) > 0:
+            games = response["dates"][0].get("games", [])
+            if games:
+                game_data = games[0]
+                is_home = game_data["teams"]["home"]["team"]["id"] == 119
+                opponent = game_data["teams"]["away"]["team"]["name"] if is_home else game_data["teams"]["home"]["team"]["name"]
+                message_content = f"⚾ **【今日賽事自動播報】**\n道奇 vs **{opponent}**\n詳細先發打序請至 MLB 官網或 App 查詢。"
+    except requests.RequestException as e:
+        print(f"⚠️ MLB API 請求失敗: {e}")
+        message_content = "❌ 無法取得今日賽事資訊，請稍後再試。"
     except Exception as e:
-        print(f"抓取名單發生錯誤: {e}")
-        return discord.Embed(title="❌ 錯誤", description="抓取名單時發生未知錯誤。", color=0xFF0000)
+        print(f"⚠️ 解析賽事資料時發生錯誤: {e}")
+        message_content = "❌ 自動抓取今日賽事名單時發生錯誤。"
 
+    await channel.send(message_content)
 
-async def auto_send_lineup():
-    channel = bot.get_channel(REMIND_CHANNEL_ID)
-    if channel:
-        embed_message = fetch_dodgers_lineup()
-        await channel.send(embed=embed_message)
-
-
-# ==============================================================================
-#  核心事件監聽 (處理開機、訊息、搜尋頻道、AI 圖片識別)
-# ==============================================================================
+# ============================================================
+# 機器人事件與命令處理
+# ============================================================
 @bot.event
 async def on_ready():
-    print(f"✅ {bot.user} 已成功上線！")
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(auto_send_lineup, "cron", hour=8, minute=0)
-    scheduler.start()
-    print("⏰ 每日道奇隊名單排程已啟動！(每日早上 08:00 推播)")
+    print(f"🤖 全自動智慧分流模組已上線：{bot.user.name}")
+    print("─" * 50)
+    print(f"⚾ 道奇定時播報 ➡️ 頻道 ID: {DODGERS_CHANNEL_ID} (每天 {AUTO_POST_HOUR:02d}:{AUTO_POST_MINUTE:02d} 發送)")
+    print(f"📖 打字查 Wiki   ➡️ 頻道 ID: {WIKI_CHANNEL_ID}")
+    print(f"📸 丟圖智慧辨識 ➡️ 頻道 ID: {IMAGE_CHANNEL_ID}")
+    print("─" * 50)
 
+    # 啟動每日排程
+    scheduler.add_job(
+        auto_post_dodgers_lineup,
+        CronTrigger(hour=AUTO_POST_HOUR, minute=AUTO_POST_MINUTE)
+    )
+    scheduler.start()
+    print("⏰ 每日排程器啟動成功。")
+    print("─" * 50)
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
-    # ✨ 【功能二：Gemini AI 圖片文字擷取與分析（含防洗版限制）】
-    if message.attachments:
-        for attachment in message.attachments:
-            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-                user_id = message.author.id
-                current_time = time.time()
-
-                # 檢查冷卻時間
-                if user_id in last_image_time and current_time - last_image_time[user_id] < IMAGE_COOLDOWN:
-                    remaining = int(IMAGE_COOLDOWN - (current_time - last_image_time[user_id]))
-                    await message.reply(f"🛑 系統冷卻中！AI 辨識圖片功能很耗資源，請等待 {remaining} 秒後再試。")
-                    return
-
-                # 通過檢查，更新時間並執行
-                last_image_time[user_id] = current_time
-                await message.channel.send("🤖 **AI 正在辨識並分析圖片中的文字，請稍候...**")
-
-                try:
-                    image_bytes = await attachment.read()
-                    mime_type = attachment.content_type or "image/jpeg"
-
-                    response = ai_client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=[
-                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                            "請精準擷取這張圖片中的所有文字，保持原本的段落排版。如果是英文的題目或課本文本，請在下方順便附上流暢的繁體中文翻譯。",
-                        ],
-                    )
-
-                    if response.text:
-                        result = response.text
-                        if len(result) > 1900:
-                            await message.channel.send(f"📝 **AI 擷取與分析結果 (上) :**\n{result[:1900]}")
-                            await message.channel.send(f"{result[1900:]}")
-                        else:
-                            await message.channel.send(f"📝 **AI 擷取與分析結果 :**\n{result}")
-                    else:
-                        await message.channel.send("❓ AI 辨識完成，但未發現明顯文字。")
-
-                except Exception as e:
-                    print(f"❌ Gemini AI 發生錯誤: {e}")
-                    await message.channel.send("❌ AI 服務暫時無法回應，請稍後再試。")
-                return
-
-    # ✨ 【功能三：專屬頻道 Wikipedia 搜尋（含防洗版限制）】
-    if message.channel.id == SEARCH_CHANNEL_ID:
-        if message.content.startswith(("! ", "!")):
+    # ---------- 1. Wiki 專用聊天室：直接查詢 ----------
+    if message.channel.id == WIKI_CHANNEL_ID:
+        keyword = message.content.strip()
+        if not keyword:
+            await message.reply("📝 請輸入你要查詢的關鍵字。")
             await bot.process_commands(message)
             return
 
-        keyword = message.content.strip()
-        if not keyword:
-            return
-
-        user_id = message.author.id
-        current_time = time.time()
-
-        # 檢查冷卻時間
-        if user_id in last_wiki_time and current_time - last_wiki_time[user_id] < WIKI_COOLDOWN:
-            remaining = int(WIKI_COOLDOWN - (current_time - last_wiki_time[user_id]))
-            await message.reply(f"🛑 搜尋太頻繁囉！請等待 {remaining} 秒後再查詢。")
-            return
-
-        # 通過檢查，更新時間並執行
-        last_wiki_time[user_id] = current_time
-        await message.channel.send(f"🔍 正在維基百科搜尋「{keyword}」...")
+        status_msg = await message.reply(f"🔍 偵測到關鍵字！正在搜尋維基百科「{keyword}」...")
         try:
             summary = wikipedia.summary(keyword, sentences=3)
-            page = wikipedia.page(keyword)
-            url = page.url
-            embed = discord.Embed(title=f"📝 結果：{keyword}", description=summary, color=0x2ECC71)
-            embed.add_field(name="🔗 連結", value=url, inline=False)
-            await message.channel.send(embed=embed)
+            await status_msg.edit(content=f"📖 **【維基百科：{keyword}】**\n\n{summary}")
+        except wikipedia.exceptions.DisambiguationError as e:
+            options = "\n".join([f"- {opt}" for opt in e.options[:5]])
+            await status_msg.edit(content=f"⚠️ 搜尋詞太模糊，請試試看更精準的詞，例如：\n{options}")
+        except wikipedia.exceptions.PageError:
+            await status_msg.edit(content=f"❌ 找不到關於「{keyword}」的維基百科條目。")
         except Exception as e:
-            print(f"維基搜尋錯誤: {e}")
-            await message.channel.send(f"❌ 找不到關於「{keyword}」的資料，請換個詞試試看！")
+            print(f"⚠️ Wiki 查詢錯誤: {e}")
+            await status_msg.edit(content=f"❌ 查詢時發生未知錯誤，請稍後再試。")
+        await bot.process_commands(message)
         return
 
+    # ---------- 2. 圖片辨識專用聊天室：自動處理圖片 ----------
+    if message.channel.id == IMAGE_CHANNEL_ID:
+        # 篩選出圖片附件
+        image_attachments = [att for att in message.attachments if att.content_type and att.content_type.startswith("image/")]
+        if image_attachments:
+            # 只取第一張（可依需求調整）
+            image_attachment = image_attachments[0]
+            if len(image_attachments) > 1:
+                await message.reply("📸 偵測到多張圖片，將僅處理第一張。")
+            thinking_message = await message.reply("📸 自動偵測到圖片！正在交由 Gemini 分析內容與翻譯...")
+
+            try:
+                # 讀取圖片資料（限制大小避免記憶體爆炸）
+                image_data = await image_attachment.read()
+                prompt = (
+                    "請精準擷取這張圖片中的所有文字，保持原本的段落排版。"
+                    "如果是英文的題目或課本文本，請在下方順便附上流暢的繁體中文翻譯。"
+                )
+
+                response = ai_client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=[
+                        types.Part.from_bytes(data=image_data, mime_type=image_attachment.content_type),
+                        prompt
+                    ]
+                )
+
+                result_text = response.text
+                if len(result_text) > 2000:
+                    result_text = result_text[:1950] + "\n\n...(內容過長已截斷)"
+
+                await thinking_message.edit(content=result_text)
+            except Exception as e:
+                print(f"⚠️ Gemini 處理發生錯誤: {e}")
+                await thinking_message.edit(content="❌ 抱歉，自動處理圖片時發生錯誤。")
+        else:
+            # 頻道內若無圖片，可選擇忽略或提示（此處僅忽略）
+            pass
+        await bot.process_commands(message)
+        return
+
+    # ---------- 其他訊息：交給命令處理器 ----------
     await bot.process_commands(message)
 
-
-# ==============================================================================
-#  功能區塊四：【常規文字指令】（使用內建 Cooldown）
-# ==============================================================================
-@bot.command()
-async def hello(ctx):
-    """打招呼指令"""
-    await ctx.send(f"你好，{ctx.author.mention}！")
-
-
-# 👈 新增限制：每 10 秒內，同一個使用者（BucketType.user）只能執行 1 次
-@bot.command(name="道奇名單")
-@commands.cooldown(1, 10, commands.BucketType.user)
-async def dodgers_lineup(ctx):
-    """手動查詢道奇名單指令"""
-    await ctx.send("正在幫你從 MLB 官網抓取最新道奇隊出賽名單...")
-    embed_message = fetch_dodgers_lineup()
-    await ctx.send(embed=embed_message)
-
-
-# 👈 新增：當指令觸發冷卻限制時，會自動捕捉並發送警告訊息，而不會在後台報錯
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        await ctx.reply(f"🛑 此指令正在冷卻中！請等待 {int(error.retry_after)} 秒後再試。")
-    else:
-        raise error
-
-
+# ============================================================
 # 啟動機器人
-bot.run(TOKEN)
+# ============================================================
+if __name__ == "__main__":
+    bot.run(TOKEN)
